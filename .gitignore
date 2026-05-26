@@ -1,0 +1,28 @@
+## Python/cache files
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+
+## Ignore all .fits files
+*.fits
+
+## Ignore all .h5 files
+*.h5
+data/
+checkpoints/
+
+## Ignore aia_synoptic_urls.txt
+aia_synoptic_urls.txt
+
+## Generated experiment artifacts
+weights/
+eval/
+plots/
+wandb/
+*.pt
+
+## Local experiment notes
+*_LOCAL_NOTES.md
+*_RUN_NOTES.md
+*_EXPERIMENT_REPORT.md
