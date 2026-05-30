@@ -1,0 +1,22 @@
+[project]
+name = "Solaris"
+version = "1.0.0"
+description = "Solaris"
+readme = "README.md"
+requires-python = ">=3.9"
+authors = [
+    {name = "Harris Abdul Majid"},
+    {name = "Pietro Sittoni"},
+    {name = "Francesco Tudisco"}
+]
+keywords = ["Foundation Model"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Operating System :: OS Independent",
+    "Intended Audience :: Science/Research",
+    "Topic :: Scientific/Engineering :: Sun",
+]
+
+[tool.setuptools]
+py-modules=["solaris"]
+

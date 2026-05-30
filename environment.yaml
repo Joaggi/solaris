@@ -1,0 +1,13 @@
+name: solaris
+channels:
+   - defaults
+   - conda-forge
+dependencies: 
+  - python=3.13
+  - pytorch=2.6.0
+  - torchvision
+    #- eionops
+  - timm
+  - h5py
+  - pandas
+  - pip
