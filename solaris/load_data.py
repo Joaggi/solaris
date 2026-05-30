@@ -100,12 +100,17 @@ class CustomDataset_missing_channel(Dataset):
 
 
 class CustomDataset_f107(Dataset):
-    def __init__(self, root_dir, data_set="train", id_dir=None):
+    def __init__(self, root_dir, data_set="train_f107", id_dir=None):
         self.root_dir = root_dir
         self.data_set = data_set
         self.id_dir = resolve_id_dir(id_dir, data_root=root_dir)
-        self.ids = self._get_valid_ids()
         self.f107 = pd.read_csv("data/AIA_12hour_512x512/f10.7.csv")
+        self.f107_column = " f107"
+
+        self.f107[self.f107_column] = self.f107[self.f107_column] / self.f107[self.f107_column].max()
+        self.f107_mean = self.f107[self.f107_column].mean()
+
+        self.ids = self._get_valid_ids()
 
     def _get_valid_ids(self):
         """Load valid data IDs from the pretraining ID file."""
@@ -121,10 +126,18 @@ class CustomDataset_f107(Dataset):
 
         #current_date = pd.to_datetime("".join(corrupted_current_timestamp[:-1]), format="%Y%m%d")
         current_date = "".join(current_timestamp[:-1])
-        target = torch.tensor(
-            self.f107[self.f107["date"] == int(current_date)][" f107"],
-            dtype=torch.float32,
-        )
+        #print(current_date, "\n")
+        #print(self.f107[self.f107["date"] == int(current_date)][" f107"], "\n")
+        target = self.f107[self.f107["date"] == int(current_date)][self.f107_column]
+        if target.size > 0:
+            target = torch.tensor(
+                self.f107[self.f107["date"] == int(current_date)][self.f107_column].iloc[0],
+                dtype=torch.float32,
+            )
+        else:
+            target = torch.tensor(self.f107_mean)
+        if torch.isnan(target):
+            target = torch.tensor(self.f107_mean)
 
         previous_data = load_wavelength_stack(self.root_dir, previous_timestamp, AIA_INPUT_WAVELENGTHS)
         current_data = load_wavelength_stack(self.root_dir, current_timestamp, AIA_INPUT_WAVELENGTHS)

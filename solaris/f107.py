@@ -457,10 +457,10 @@ def train_f107(
     num_workers: int = 8,
     stop_after_seconds: int | None = None,
     backbone_name: str = "local_pretrain",
-    run_name: str = "solaris_missing_channel",
+    run_name: str = "solaris_f107",
     resume: bool = True,
     use_wandb: bool = False,
-    wandb_project: str = "solaris",
+    wandb_project: str = "allshaman",
     wandb_entity: str | None = None,
     use_ema: bool = False,
     ema_decay: float = 0.999,
@@ -503,7 +503,7 @@ def train_f107(
         generator=generator,
     )
 
-    model = Solaris_F107(freeze=True, output_dim=1, out_levels=len(WAVELENGTHS), patch_size=patch_size).to(device)
+    model = Solaris_F107(freeze_backbone=True, output_dim=1, out_levels=len(WAVELENGTHS), patch_size=patch_size).to(device)
     norm_coeff_1 = torch.nn.Parameter(torch.tensor(0.5, device=device))
     norm_coeff_2 = torch.nn.Parameter(torch.tensor(0.5, device=device))
     optimizer = AdamW(
@@ -572,20 +572,29 @@ def train_f107(
     last_loss = float("nan")
     optimizer.zero_grad(set_to_none=True)
 
+    loss = torch.nn.MSELoss()
+
     while global_step < max_steps:
         for batch_idx, (data, target, timestamps) in enumerate(loader):
             data = data.to(device=device, non_blocking=True)
             target = target.to(device=device, non_blocking=True)
+            #print(target)
 
             data = transform(data, norm_coeff_1, norm_coeff_2, scale_factors)
             metadata = build_metadata(data, timestamps)
 
-            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+            with torch.autocast(device_type="cuda:1", dtype=torch.bfloat16):
                 output = model(data, metadata, 12, 0).squeeze(1)
-            loss = _paper_weighted_mae(output.float(), target.float(), scale_factors)
-            loss = loss / grad_accum_steps
 
-            loss.backward()
+            loss_output = loss(output.float(), target.float())
+            loss_output = loss_output / grad_accum_steps
+            
+
+            loss_output.backward()
+
+            #for name, p in model.named_parameters():
+            #    if p.grad is not None:
+            #        print(name, p.grad.norm().item())
 
             if (batch_idx + 1) % grad_accum_steps != 0:
                 continue
@@ -595,7 +604,7 @@ def train_f107(
             scheduler.step()
             optimizer.zero_grad(set_to_none=True)
             global_step += 1
-            last_loss = float(loss.detach().cpu()) * grad_accum_steps
+            last_loss = float(loss_output.detach().cpu()) * grad_accum_steps
             if ema is not None:
                 ema.update(model, norm_coeff_1, norm_coeff_2, global_step)
 
@@ -889,7 +898,7 @@ def inspect_dataset(limit: int = 8) -> dict:
 
 
 def main_mode(
-    mode: str = "train_missing_channel",
+    mode: str = "train_f107",
     steps: int = 7750,
     quick_check_seconds: int = 300,
     batch_size: int = 8,
@@ -897,7 +906,7 @@ def main_mode(
     patch_size: int = DEFAULT_PATCH_SIZE,
     seed: int = 42,
     deterministic: bool = False,
-    run_name: str = "missing_channel",
+    run_name: str = "f107",
     data_set: str = "val",
     sample_index: int = 0,
     eval_samples: int = 64,
@@ -973,13 +982,13 @@ def main():
     parser.add_argument( "--sample-index", type=int, default=0,)
     parser.add_argument( "--eval-samples", type=int, default=64,)
     parser.add_argument( "--eval-batch-size", type=int, default=4,)
-    parser.add_argument( "--use-wandb", action="store_true",)
-    parser.add_argument( "--wandb-project", type=str, default="solaris",)
+    parser.add_argument( "--use-wandb", action="store_true", default=False)
+    parser.add_argument( "--wandb-project", type=str, default="allshaman",)
     parser.add_argument( "--wandb-entity", type=str, default=None,)
     parser.add_argument( "--use-ema", action="store_true", default=False)
     parser.add_argument( "--ema-decay", type=float, default=0.999,)
     parser.add_argument( "--ema-update-every", type=int, default=10,)
-    parser.add_argument( "--checkpoint-every", type=int, default=1000,)
+    parser.add_argument( "--checkpoint-every", type=int, default=10,)
 
     args = parser.parse_args()
 

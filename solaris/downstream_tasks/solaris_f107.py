@@ -14,7 +14,7 @@ __all__ = ["Solaris_F107", "SolarisHighRes", "SolarisSmall", "SolarisTiny"]
 class Solaris_F107(nn.Module):
     def __init__(
         self,
-        freeze,
+        freeze_backbone,
         output_dim,
         patch_size: int = 8,
         embed_dim: int = 256,
@@ -37,8 +37,8 @@ class Solaris_F107(nn.Module):
         use_lora: bool = False,
         lora_mode: LoRAMode = "single",
         lora_steps: int = 40,
-        hidden_layer_dims=[512, 512, 512],
-        dropout=0.0,
+        hidden_layer_dims=[512,512,512],
+        dropout=0.1,
         mask_ratio=0.0,
     ):
         super().__init__()
@@ -72,10 +72,25 @@ class Solaris_F107(nn.Module):
             lora_steps=lora_steps,
         )
 
-        self.norm = nn.LayerNorm(embed_dim * 2)
+        if freeze_backbone:
+            self.encoder.requires_grad_(False)
+            self.backbone.requires_grad_(False)
+            self.encoder.eval()
+            for param in self.encoder.parameters():
+                param.required_grad = False
+            self.backbone.eval()
+            for param in self.backbone.parameters():
+                param.required_grad = False
+
+
+
+        self.norm = nn.LayerNorm(embed_dim * 4)
+
+        self.flatten = nn.Flatten(1, -1)
 
         # Define the dimensions of the MLP layers
-        dims = [embed_dim * 2] + hidden_layer_dims
+        dims = [embed_dim * 4] + hidden_layer_dims
+        #dims = [embed_dim/patch_size * 2] + hidden_layer_dims
 
         # Define the dropout layer
         self.dropout = nn.Dropout(p=dropout)
@@ -86,7 +101,8 @@ class Solaris_F107(nn.Module):
         )
 
         # Define the activation function
-        self.acts = nn.ModuleList([nn.LeakyReLU(0.01) for _ in range(len(dims) - 1)])
+        #self.acts = nn.ModuleList([nn.LeakyReLU(0.01) for _ in range(len(dims) - 1)])
+        self.acts = nn.ModuleList([nn.GELU() for _ in range(len(dims) - 1)])
 
         # Define the output layer
         self.fc_out = nn.Linear(dims[-1], output_dim)
@@ -129,13 +145,20 @@ class Solaris_F107(nn.Module):
 
         x = self.backbone(x, lead_time, rollout_step=rollout_step, patch_res=patch_res)
 
-        x_cls = self.norm(x_cls)
-        for fc, act in zip(self.fcs, self.acts):
-            x_cls = self.dropout(x_cls)
-            x_cls = fc(x_cls)
-            x_cls = act(x_cls)
 
-        logits = self.fc_out(x_cls)
+        x_avg = x.mean(dim=1)
+        x_max = x.max(dim=1).values
+        x = torch.cat([x_avg, x_max], dim=-1)
+        #x = x.flatten()
+
+        x = self.norm(x)
+        
+        for fc, act in zip(self.fcs, self.acts):
+            x = self.dropout(x)
+            x = fc(x)
+            x = act(x)
+
+        logits = self.fc_out(x)
 
         return logits
 
