@@ -1,5 +1,8 @@
 import torch
 from torch.utils.data import Dataset
+import pandas as pd
+
+
 
 from solaris.utils_data import (
     AIA_INPUT_WAVELENGTHS,
@@ -68,7 +71,7 @@ class CustomDataset_pretrain(Dataset):
 
 
 class CustomDataset_missing_channel(Dataset):
-    def __init__(self, root_dir, data_set="train", id_dir=None):
+    def __init__(self, root_dir, data_set="train_missing_channel", id_dir=None):
         self.root_dir = root_dir
         self.data_set = data_set
         self.id_dir = resolve_id_dir(id_dir, data_root=root_dir)
@@ -95,3 +98,36 @@ class CustomDataset_missing_channel(Dataset):
 
         return data, target, timestamp_to_datetime(corrupted_current_timestamp)
 
+
+class CustomDataset_f107(Dataset):
+    def __init__(self, root_dir, data_set="train", id_dir=None):
+        self.root_dir = root_dir
+        self.data_set = data_set
+        self.id_dir = resolve_id_dir(id_dir, data_root=root_dir)
+        self.ids = self._get_valid_ids()
+        self.f107 = pd.read_csv("data/AIA_12hour_512x512/f10.7.csv")
+
+    def _get_valid_ids(self):
+        """Load valid data IDs from the pretraining ID file."""
+        return read_id_file(self.id_dir / f"{self.data_set}_id.txt")
+
+    def __len__(self):
+        return len(self.ids)
+
+    def __getitem__(self, idx):
+        """Get two 12-hour-separated history states and the 12-hour forecast target."""
+        current_timestamp = self.ids[idx]
+        previous_timestamp = add_hours(current_timestamp, -12)
+
+        #current_date = pd.to_datetime("".join(corrupted_current_timestamp[:-1]), format="%Y%m%d")
+        current_date = "".join(current_timestamp[:-1])
+        target = torch.tensor(
+            self.f107[self.f107["date"] == int(current_date)][" f107"],
+            dtype=torch.float32,
+        )
+
+        previous_data = load_wavelength_stack(self.root_dir, previous_timestamp, AIA_INPUT_WAVELENGTHS)
+        current_data = load_wavelength_stack(self.root_dir, current_timestamp, AIA_INPUT_WAVELENGTHS)
+        data = torch.stack((previous_data, current_data), dim=0)
+
+        return data, target, timestamp_to_datetime(current_timestamp)
