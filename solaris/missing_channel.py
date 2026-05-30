@@ -430,270 +430,6 @@ def prepare_dataset(force_download: bool = False, force_splits: bool = False) ->
     return counts
 
 
-def train(
-    max_steps: int = 7750,
-    batch_size: int = 8,
-    grad_accum_steps: int = 4,
-    patch_size: int = DEFAULT_PATCH_SIZE,
-    seed: int = 42,
-    deterministic: bool = False,
-    lr: float = 5e-4,
-    min_lr: float = 5e-5,
-    warmup_steps: int = 500,
-    weight_decay: float = 0.05,
-    checkpoint_every: int = 250,
-    num_workers: int = 8,
-    stop_after_seconds: int | None = None,
-    run_name: str = "solaris_pretrain",
-    resume: bool = True,
-    use_wandb: bool = False,
-    wandb_project: str = "solaris",
-    wandb_entity: str | None = None,
-    use_ema: bool = False,
-    ema_decay: float = 0.999,
-    ema_update_every: int = 10,
-) -> str:
-    sys.path.insert(0, "/root/solaris")
-
-    import torch
-    from torch.optim import AdamW
-    from torch.utils.data import DataLoader
-
-    from solaris.load_data import CustomDataset_pretrain
-    from solaris.model.solaris import SolarisSmall
-    from solaris.normalization import transform
-    from solaris.utils_data import build_metadata
-
-    _seed_everything(seed, deterministic=deterministic)
-    split_counts = _ensure_dataset()
-    print(f"Split counts: {split_counts}")
-
-    device = torch.device("cuda")
-    torch.backends.cuda.matmul.allow_tf32 = True
-    torch.backends.cudnn.allow_tf32 = True
-    torch.set_float32_matmul_precision("high")
-    generator = torch.Generator()
-    generator.manual_seed(seed)
-
-    dataset = CustomDataset_pretrain(root_dir=DATA_DIR, data_set="train", id_dir=SPLIT_DIR)
-    loader = DataLoader(
-        dataset,
-        batch_size=batch_size,
-        shuffle=True,
-        drop_last=True,
-        num_workers=num_workers,
-        pin_memory=True,
-        persistent_workers=num_workers > 0,
-        collate_fn=_collate_pretrain,
-        worker_init_fn=_seed_worker,
-        generator=generator,
-    )
-
-    model = SolarisSmall(out_levels=len(WAVELENGTHS), patch_size=patch_size).to(device)
-    norm_coeff_1 = torch.nn.Parameter(torch.tensor(0.5, device=device))
-    norm_coeff_2 = torch.nn.Parameter(torch.tensor(0.5, device=device))
-    optimizer = AdamW(
-        _param_groups(model, [norm_coeff_1, norm_coeff_2], weight_decay),
-        lr=lr,
-        betas=(0.9, 0.95),
-        weight_decay=weight_decay,
-    )
-    all_optim_params = [p for g in optimizer.param_groups for p in g["params"]]
-    scheduler = _make_scheduler(optimizer, warmup_steps, max_steps, min_lr / lr)
-    scale_factor_values = _compute_train_scale_factors()
-    print(f"scale_factors={scale_factor_values}", flush=True)
-    scale_factors = torch.tensor(scale_factor_values, device=device, dtype=torch.float32)
-    ema = CpuEMA(model, norm_coeff_1, norm_coeff_2, decay=ema_decay, update_every=ema_update_every) if use_ema else None
-
-    wandb_run = None
-    if use_wandb:
-        import wandb
-
-        wandb_config = {
-            "max_steps": max_steps,
-            "batch_size": batch_size,
-            "grad_accum_steps": grad_accum_steps,
-            "effective_batch_size": batch_size * grad_accum_steps,
-            "patch_size": patch_size,
-            "seed": seed,
-            "deterministic": deterministic,
-            "lr": lr,
-            "min_lr": min_lr,
-            "warmup_steps": warmup_steps,
-            "weight_decay": weight_decay,
-            "betas": (0.9, 0.95),
-            "checkpoint_every": checkpoint_every,
-            "use_ema": use_ema,
-            "ema_decay": ema_decay,
-            "ema_update_every": ema_update_every,
-            "wavelengths": WAVELENGTHS,
-            "scale_factors": scale_factor_values,
-        }
-        wandb_run = wandb.init(
-            project=wandb_project,
-            entity=wandb_entity,
-            name=run_name,
-            id=run_name,
-            resume="allow",
-            config=wandb_config,
-        )
-
-    latest_path = CHECKPOINT_DIR / f"{run_name}_latest.pt"
-    global_step = 0
-    if resume and latest_path.exists():
-        checkpoint = torch.load(latest_path, map_location=device, weights_only=False)
-        model.load_state_dict(checkpoint["model_state_dict"])
-        optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
-        scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
-        norm_coeff_1.data.copy_(checkpoint["norm_coeff_1"].to(device=device))
-        norm_coeff_2.data.copy_(checkpoint["norm_coeff_2"].to(device=device))
-        if ema is not None and "ema_model_state_dict" in checkpoint:
-            ema.load_state_dict(checkpoint)
-        global_step = int(checkpoint["step"])
-        print(f"resumed_checkpoint={latest_path} step={global_step}", flush=True)
-        if checkpoint.get("seed") not in (None, seed):
-            print(f"warning=checkpoint_seed_mismatch checkpoint_seed={checkpoint.get('seed')} requested_seed={seed}", flush=True)
-
-    start_time = time.monotonic()
-    last_loss = float("nan")
-    optimizer.zero_grad(set_to_none=True)
-
-    while global_step < max_steps:
-        for batch_idx, (data, target, timestamps) in enumerate(loader):
-            data = data.to(device=device, non_blocking=True)
-            target = target.to(device=device, non_blocking=True)
-
-            data = transform(data, norm_coeff_1, norm_coeff_2, scale_factors)
-            metadata = build_metadata(data, timestamps)
-
-            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                output = model(data, metadata, 12, 0).squeeze(1)
-            loss = _paper_weighted_mae(output.float(), target.float(), scale_factors)
-            loss = loss / grad_accum_steps
-
-            loss.backward()
-
-            if (batch_idx + 1) % grad_accum_steps != 0:
-                continue
-
-            torch.nn.utils.clip_grad_norm_(all_optim_params, 1.0)
-            optimizer.step()
-            scheduler.step()
-            optimizer.zero_grad(set_to_none=True)
-            global_step += 1
-            last_loss = float(loss.detach().cpu()) * grad_accum_steps
-            if ema is not None:
-                ema.update(model, norm_coeff_1, norm_coeff_2, global_step)
-
-            if global_step == 1 or global_step % 10 == 0:
-                with torch.no_grad():
-                    rmse_channels, rmse_mean = _raw_rmse(output.detach().float(), target, scale_factors)
-                current_lr = scheduler.get_last_lr()[0]
-                elapsed = time.monotonic() - start_time
-                print(
-                    f"step={global_step} loss={last_loss:.6f} lr={current_lr:.6e} "
-                    f"rmse_mean_raw={float(rmse_mean.detach().cpu()):.3f} "
-                    f"rmse_raw={[round(float(v), 3) for v in rmse_channels.detach().cpu()]} "
-                    f"elapsed_min={elapsed / 60:.1f}",
-                    flush=True,
-                )
-                if wandb_run is not None:
-                    log_data = {
-                        "train/loss_weighted_mae": last_loss,
-                        "train/lr": current_lr,
-                        "train/rmse_mean_raw": float(rmse_mean.detach().cpu()),
-                        "train/elapsed_min": elapsed / 60,
-                    }
-                    for wavelength, value in zip(WAVELENGTHS, rmse_channels.detach().cpu()):
-                        log_data[f"train/rmse_raw/{wavelength}"] = float(value)
-                    wandb_run.log(log_data, step=global_step)
-
-            if global_step % checkpoint_every == 0 or global_step >= max_steps:
-                ckpt_path = CHECKPOINT_DIR / f"{run_name}_step_{global_step:05d}.pt"
-                _save_checkpoint(
-                    ckpt_path,
-                    model,
-                    optimizer,
-                    scheduler,
-                    norm_coeff_1,
-                    norm_coeff_2,
-                    global_step,
-                    last_loss,
-                    scale_factor_values,
-                    patch_size,
-                    seed,
-                    ema,
-                )
-                _save_checkpoint(
-                    CHECKPOINT_DIR / f"{run_name}_latest.pt",
-                    model,
-                    optimizer,
-                    scheduler,
-                    norm_coeff_1,
-                    norm_coeff_2,
-                    global_step,
-                    last_loss,
-                    scale_factor_values,
-                    patch_size,
-                    seed,
-                    ema,
-                )
-                print(f"saved_checkpoint={ckpt_path}", flush=True)
-
-            if stop_after_seconds is not None and time.monotonic() - start_time >= stop_after_seconds:
-                ckpt_path = CHECKPOINT_DIR / f"{run_name}_quick_check_step_{global_step:05d}.pt"
-                _save_checkpoint(
-                    ckpt_path,
-                    model,
-                    optimizer,
-                    scheduler,
-                    norm_coeff_1,
-                    norm_coeff_2,
-                    global_step,
-                    last_loss,
-                    scale_factor_values,
-                    patch_size,
-                    seed,
-                    ema,
-                )
-                if wandb_run is not None:
-                    wandb_run.finish()
-                return str(ckpt_path)
-
-            if global_step >= max_steps:
-                break
-
-        if global_step >= max_steps:
-            break
-        if (batch_idx + 1) % grad_accum_steps != 0:
-            torch.nn.utils.clip_grad_norm_(all_optim_params, 1.0)
-            optimizer.step()
-            scheduler.step()
-            optimizer.zero_grad(set_to_none=True)
-            global_step += 1
-            last_loss = float(loss.detach().cpu()) * grad_accum_steps
-            if ema is not None:
-                ema.update(model, norm_coeff_1, norm_coeff_2, global_step)
-
-    final_path = CHECKPOINT_DIR / f"{run_name}_final_step_{global_step:05d}.pt"
-    _save_checkpoint(
-        final_path,
-        model,
-        optimizer,
-        scheduler,
-        norm_coeff_1,
-        norm_coeff_2,
-        global_step,
-        last_loss,
-        scale_factor_values,
-        patch_size,
-        seed,
-        ema,
-    )
-    if wandb_run is not None:
-        wandb_run.finish()
-    return str(final_path)
-
 
 def list_checkpoints() -> list[str]:
     if not CHECKPOINT_DIR.exists():
@@ -705,118 +441,6 @@ def get_scale_factors() -> list[float]:
     _ensure_dataset()
     return _compute_train_scale_factors()
 
-
-def plot_prediction(
-    data_set: str = "val",
-    sample_index: int = 0,
-    run_name: str = "solaris_pretrain_paperloss_p8",
-    use_ema: bool = False,
-) -> str:
-    sys.path.insert(0, "/root/solaris")
-
-    import matplotlib
-
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-    import numpy as np
-    import torch
-
-    from solaris.load_data import CustomDataset_pretrain
-    from solaris.model.solaris import SolarisSmall
-    from solaris.normalization import transform
-    from solaris.utils_data import build_metadata
-
-    _ensure_dataset()
-    PLOT_DIR.mkdir(parents=True, exist_ok=True)
-
-    checkpoint_path = _checkpoint_path_for_run(run_name)
-
-    device = torch.device("cuda")
-    torch.backends.cuda.matmul.allow_tf32 = True
-    torch.backends.cudnn.allow_tf32 = True
-    torch.set_float32_matmul_precision("high")
-
-    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
-    wavelengths = tuple(checkpoint.get("wavelengths", WAVELENGTHS))
-    scale_factors = torch.tensor(
-        checkpoint.get("scale_factors", _compute_train_scale_factors()),
-        device=device,
-        dtype=torch.float32,
-    )
-    norm_coeff_1 = checkpoint["norm_coeff_1"].to(device=device, dtype=torch.float32)
-    norm_coeff_2 = checkpoint["norm_coeff_2"].to(device=device, dtype=torch.float32)
-    if use_ema and "ema_model_state_dict" in checkpoint:
-        norm_coeff_1 = checkpoint["ema_norm_coeff_1"].to(device=device, dtype=torch.float32)
-        norm_coeff_2 = checkpoint["ema_norm_coeff_2"].to(device=device, dtype=torch.float32)
-
-    model = SolarisSmall(out_levels=len(wavelengths), patch_size=int(checkpoint.get("patch_size", DEFAULT_PATCH_SIZE))).to(device)
-    model.load_state_dict(checkpoint["ema_model_state_dict"] if use_ema and "ema_model_state_dict" in checkpoint else checkpoint["model_state_dict"])
-    model.eval()
-
-    dataset = CustomDataset_pretrain(root_dir=DATA_DIR, data_set=data_set, id_dir=SPLIT_DIR)
-    if not 0 <= sample_index < len(dataset):
-        raise IndexError(f"sample_index={sample_index} is outside {data_set} split length {len(dataset)}.")
-
-    data, target, timestamp = dataset[sample_index]
-    data_batch = data.unsqueeze(0).to(device=device)
-    target_batch = target.unsqueeze(0).to(device=device)
-    with torch.no_grad(), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-        transformed = transform(data_batch, norm_coeff_1, norm_coeff_2, scale_factors)
-        metadata = build_metadata(transformed, (timestamp,))
-        prediction_normalised = model(transformed, metadata, 12, 0).squeeze(1)
-    prediction_raw = _unscale_prediction(prediction_normalised.float(), scale_factors)
-
-    rmse = torch.sqrt(torch.mean((prediction_raw - target_batch.float()) ** 2, dim=(0, 2, 3)))
-    mae = torch.mean(torch.abs(prediction_raw - target_batch.float()), dim=(0, 2, 3))
-
-    inputs = data.cpu().numpy()
-    target_np = target.cpu().numpy()
-    prediction_np = prediction_raw.squeeze(0).detach().cpu().numpy()
-    error_np = prediction_np - target_np
-
-    def log_image(array):
-        return np.log10(np.clip(array, a_min=0, a_max=None) + 1.0)
-
-    rows = [
-        ("input t-12h", inputs[0], "magma"),
-        ("input t", inputs[1], "magma"),
-        ("target t+12h", target_np, "magma"),
-        ("prediction t+12h", prediction_np, "magma"),
-        ("prediction - target", error_np, "coolwarm"),
-    ]
-    fig, axes = plt.subplots(len(rows), len(wavelengths), figsize=(2.6 * len(wavelengths), 12), constrained_layout=True)
-    for col, wavelength in enumerate(wavelengths):
-        raw_stack = np.stack((inputs[0, col], inputs[1, col], target_np[col], prediction_np[col]))
-        log_stack = log_image(raw_stack)
-        vmin, vmax = np.percentile(log_stack, [1, 99.7])
-        max_abs_error = np.percentile(np.abs(error_np[col]), 99.5)
-        max_abs_error = float(max(max_abs_error, 1e-6))
-
-        for row, (label, images, cmap) in enumerate(rows):
-            axis = axes[row, col]
-            if row < 4:
-                image_data = log_image(images[col])
-                axis.imshow(image_data, cmap=cmap, vmin=vmin, vmax=vmax)
-            else:
-                axis.imshow(images[col], cmap=cmap, vmin=-max_abs_error, vmax=max_abs_error)
-            axis.set_xticks([])
-            axis.set_yticks([])
-            if row == 0:
-                axis.set_title(f"{wavelength} A\nRMSE {float(rmse[col]):.2f}", fontsize=9)
-            if col == 0:
-                axis.set_ylabel(label, fontsize=10)
-            if row == len(rows) - 1:
-                axis.set_xlabel(f"MAE {float(mae[col]):.2f}", fontsize=8)
-
-    fig.suptitle(
-        f"Solaris-S checkpoint {checkpoint_path.name}{' EMA' if use_ema and 'ema_model_state_dict' in checkpoint else ''} | {data_set}[{sample_index}] | current time {timestamp.isoformat()}",
-        fontsize=12,
-    )
-    ema_suffix = "_ema" if use_ema and "ema_model_state_dict" in checkpoint else ""
-    output_path = PLOT_DIR / f"{run_name}{ema_suffix}_{data_set}_{sample_index:04d}_prediction.png"
-    fig.savefig(output_path, dpi=160)
-    plt.close(fig)
-    return str(output_path)
 
 def train_missing_channel(
     max_steps: int = 7750,
@@ -857,14 +481,14 @@ def train_missing_channel(
     split_counts = _ensure_dataset()
     print(f"Split counts: {split_counts}")
 
-    device = torch.device("cuda")
+    device = torch.device("cuda:1")
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
     torch.set_float32_matmul_precision("high")
     generator = torch.Generator()
     generator.manual_seed(seed)
 
-    dataset = CustomDataset_missing_channel(root_dir=DATA_DIR, data_set="train", id_dir=SPLIT_DIR)
+    dataset = CustomDataset_missing_channel(root_dir=DATA_DIR, data_set="train_missing_channel", id_dir=SPLIT_DIR)
     loader = DataLoader(
         dataset,
         batch_size=batch_size,
@@ -1107,7 +731,7 @@ def plot_missing_channel(
 
     checkpoint_path = _checkpoint_path_for_run(run_name)
 
-    device = torch.device("cuda")
+    device = torch.device("cuda:1")
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
     torch.set_float32_matmul_precision("high")
@@ -1399,47 +1023,8 @@ def main_mode(
 ):
     if mode == "prepare":
         print(prepare_dataset.remote())
-    elif mode == "quick_check":
-        print(
-            train.remote(
-                max_steps=steps,
-                batch_size=batch_size,
-                grad_accum_steps=grad_accum_steps,
-                patch_size=patch_size,
-                seed=seed,
-                deterministic=deterministic,
-                stop_after_seconds=quick_check_seconds,
-                run_name=f"{run_name}_quick_check",
-                resume=False,
-                use_wandb=use_wandb,
-                wandb_project=wandb_project,
-                wandb_entity=wandb_entity,
-                use_ema=use_ema,
-                ema_decay=ema_decay,
-                ema_update_every=ema_update_every,
-                checkpoint_every=checkpoint_every,
-            )
-        )
-    elif mode == "train":
-        print(
-            train.remote(
-                max_steps=steps,
-                batch_size=batch_size,
-                grad_accum_steps=grad_accum_steps,
-                patch_size=patch_size,
-                seed=seed,
-                deterministic=deterministic,
-                run_name=run_name,
-                resume=True,
-                use_wandb=use_wandb,
-                wandb_project=wandb_project,
-                wandb_entity=wandb_entity,
-                use_ema=use_ema,
-                ema_decay=ema_decay,
-                ema_update_every=ema_update_every,
-                checkpoint_every=checkpoint_every,
-            )
-        )
+   
+    
     elif mode == "train_missing_channel":
         print(
             train_missing_channel(
@@ -1460,33 +1045,12 @@ def main_mode(
                 checkpoint_every=checkpoint_every,
             )
         )
-    elif mode == "train_detached":
-        call = train.spawn(
-            max_steps=steps,
-            batch_size=batch_size,
-            grad_accum_steps=grad_accum_steps,
-            patch_size=patch_size,
-            seed=seed,
-            deterministic=deterministic,
-            run_name=run_name,
-            resume=True,
-            use_wandb=use_wandb,
-            wandb_project=wandb_project,
-            wandb_entity=wandb_entity,
-            use_ema=use_ema,
-            ema_decay=ema_decay,
-            ema_update_every=ema_update_every,
-            checkpoint_every=checkpoint_every,
-        )
-        print(f"spawned_call_id={call.object_id}")
     elif mode == "list":
         print("\n".join(list_checkpoints.remote()))
     elif mode == "inspect":
         print(inspect_dataset.remote())
     elif mode == "scales":
         print(get_scale_factors.remote())
-    elif mode == "plot":
-        print(plot_prediction(data_set=data_set, sample_index=sample_index, run_name=run_name, use_ema=use_ema))
     elif mode == "plot_missing_channel":
         print(plot_missing_channel(data_set=data_set, sample_index=sample_index, run_name=run_name, use_ema=use_ema))
     elif mode == "eval_mse":
@@ -1510,7 +1074,7 @@ def main():
     parser = argparse.ArgumentParser()
 
     parser.add_argument( "--mode", type=str, default="train_missing_channel",)
-    parser.add_argument( "--steps", type=int, default=1000,)
+    parser.add_argument( "--steps", type=int, default=10000,)
     parser.add_argument( "--quick-check-seconds", type=int, default=300,)
     parser.add_argument( "--batch-size", type=int, default=8,)
     parser.add_argument( "--grad-accum-steps", type=int, default=4,)
