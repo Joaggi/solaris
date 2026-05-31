@@ -719,10 +719,10 @@ def train_f107(
 
 
 def evaluate_mse_subset(
-    data_set: str = "val",
+    data_set: str = "test_f107",
     max_samples: int = 64,
     batch_size: int = 4,
-    run_name: str = "local_pretrain",
+    run_name: str = "solaris_f107",
     use_ema: bool = False,
 ) -> dict:
     sys.path.insert(0, "/root/solaris")
@@ -730,8 +730,8 @@ def evaluate_mse_subset(
     import torch
     from torch.utils.data import DataLoader, Subset
 
-    from solaris.load_data import CustomDataset_pretrain
-    from solaris.model.solaris import SolarisSmall
+    from solaris.load_data import CustomDataset_f107
+    from solaris.downstream_tasks.solaris_f107 import Solaris_F107
     from solaris.normalization import transform
     from solaris.utils_data import build_metadata
 
@@ -758,11 +758,11 @@ def evaluate_mse_subset(
         norm_coeff_1 = checkpoint["ema_norm_coeff_1"].to(device=device, dtype=torch.float32)
         norm_coeff_2 = checkpoint["ema_norm_coeff_2"].to(device=device, dtype=torch.float32)
 
-    model = SolarisSmall(out_levels=len(wavelengths), patch_size=int(checkpoint.get("patch_size", DEFAULT_PATCH_SIZE))).to(device)
+    model = Solaris_F107(out_levels=len(wavelengths), patch_size=int(checkpoint.get("patch_size", DEFAULT_PATCH_SIZE))).to(device)
     model.load_state_dict(checkpoint["ema_model_state_dict"] if has_ema else checkpoint["model_state_dict"])
     model.eval()
 
-    dataset = CustomDataset_pretrain(root_dir=DATA_DIR, data_set=data_set, id_dir=SPLIT_DIR)
+    dataset = CustomDataset_f107(root_dir=DATA_DIR, data_set=data_set, id_dir=SPLIT_DIR)
     if len(dataset) == 0:
         raise ValueError(f"{data_set!r} split is empty.")
     sample_count = min(max_samples, len(dataset))
@@ -802,8 +802,8 @@ def evaluate_mse_subset(
                 prediction_normalised = model(transformed, metadata, 12, 0).squeeze(1)
             prediction_raw = _unscale_prediction(prediction_normalised.float(), scale_factors)
             error = prediction_raw - target
-            squared_error_sum += torch.sum(error.double() ** 2, dim=(0, 2, 3))
-            absolute_error_sum += torch.sum(torch.abs(error).double(), dim=(0, 2, 3))
+            squared_error_sum += torch.sum(error.double() ** 2)
+            absolute_error_sum += torch.sum(torch.abs(error).double())
             pixel_count += target.shape[0] * target.shape[-2] * target.shape[-1]
             evaluated_samples += target.shape[0]
             first_timestamp = first_timestamp or timestamps[0].isoformat()
@@ -849,14 +849,6 @@ def evaluate_mse_subset(
         "| Wavelength (A) | MSE (raw intensity^2) | RMSE (raw intensity) | MAE (raw intensity) |",
         "|---:|---:|---:|---:|",
     ]
-    for wavelength, mse_value, rmse_value, mae_value in zip(wavelengths, result["mse_raw"], result["rmse_raw"], result["mae_raw"]):
-        lines.append(f"| {wavelength} | {mse_value:.6g} | {rmse_value:.6g} | {mae_value:.6g} |")
-    lines.extend(
-        [
-            f"| **Mean** | **{result['mean_mse_raw']:.6g}** | **{result['mean_rmse_raw']:.6g}** | **{result['mean_mae_raw']:.6g}** |",
-            "",
-        ]
-    )
     md_path.write_text("\n".join(lines), encoding="utf-8")
     result["json_path"] = str(json_path)
     result["markdown_path"] = str(md_path)
