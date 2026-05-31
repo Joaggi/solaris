@@ -565,6 +565,7 @@ def train_missing_channel(
 
     # Assign the pretrain backbone to the current model
     model.backbone = model_backbone.backbone
+    model.encoder = model_backbone.encoder
 
     start_time = time.monotonic()
     last_loss = float("nan")
@@ -821,10 +822,10 @@ def plot_missing_channel(
 
 
 def evaluate_mse_subset(
-    data_set: str = "val",
+    data_set: str = "test_missing_channel",
     max_samples: int = 64,
     batch_size: int = 4,
-    run_name: str = "local_pretrain",
+    run_name: str = "missing_channel",
     use_ema: bool = False,
 ) -> dict:
     sys.path.insert(0, "/root/solaris")
@@ -832,7 +833,7 @@ def evaluate_mse_subset(
     import torch
     from torch.utils.data import DataLoader, Subset
 
-    from solaris.load_data import CustomDataset_pretrain
+    from solaris.load_data import CustomDataset_missing_channel
     from solaris.model.solaris import SolarisSmall
     from solaris.normalization import transform
     from solaris.utils_data import build_metadata
@@ -864,7 +865,7 @@ def evaluate_mse_subset(
     model.load_state_dict(checkpoint["ema_model_state_dict"] if has_ema else checkpoint["model_state_dict"])
     model.eval()
 
-    dataset = CustomDataset_pretrain(root_dir=DATA_DIR, data_set=data_set, id_dir=SPLIT_DIR)
+    dataset = CustomDataset_missing_channel(root_dir=DATA_DIR, data_set=data_set, id_dir=SPLIT_DIR)
     if len(dataset) == 0:
         raise ValueError(f"{data_set!r} split is empty.")
     sample_count = min(max_samples, len(dataset))
@@ -887,10 +888,13 @@ def evaluate_mse_subset(
         collate_fn=_collate_pretrain,
     )
 
+    total_squared_error_sum = torch.tensor(0, dtype=torch.float64, device=device)
+    total_absolute_error_sum = torch.tensor(0, dtype=torch.float64, device=device)
     squared_error_sum = torch.zeros(len(wavelengths), dtype=torch.float64, device=device)
     absolute_error_sum = torch.zeros(len(wavelengths), dtype=torch.float64, device=device)
     pixel_count = 0
-    evaluated_samples = 0
+    total_pixel_count = torch.tensor(0, dtype=torch.int64, device=device)
+    evaluated_samples = torch.tensor(0, dtype=torch.int64, device=device)
     first_timestamp = None
     last_timestamp = None
 
@@ -904,16 +908,23 @@ def evaluate_mse_subset(
                 prediction_normalised = model(transformed, metadata, 12, 0).squeeze(1)
             prediction_raw = _unscale_prediction(prediction_normalised.float(), scale_factors)
             error = prediction_raw - target
+            total_squared_error_sum += torch.sum(error.double() ** 2)
+            total_absolute_error_sum += torch.sum(torch.abs(error).double())
             squared_error_sum += torch.sum(error.double() ** 2, dim=(0, 2, 3))
             absolute_error_sum += torch.sum(torch.abs(error).double(), dim=(0, 2, 3))
             pixel_count += target.shape[0] * target.shape[-2] * target.shape[-1]
+            total_pixel_count += torch.prod(torch.tensor(target.size()))
             evaluated_samples += target.shape[0]
             first_timestamp = first_timestamp or timestamps[0].isoformat()
             last_timestamp = timestamps[-1].isoformat()
 
+    total_rmse = torch.sqrt(total_squared_error_sum) / total_pixel_count
+    total_mse = total_squared_error_sum / total_pixel_count
+    total_mae = total_absolute_error_sum / total_pixel_count
     mse = squared_error_sum / pixel_count
     rmse = torch.sqrt(mse)
     mae = absolute_error_sum / pixel_count
+    evaluated_samples = evaluated_samples.detach().cpu().item()
     result = {
         "run_name": run_name,
         "checkpoint": str(checkpoint_path),
@@ -932,6 +943,9 @@ def evaluate_mse_subset(
         "mean_mse_raw": float(mse.mean().detach().cpu()),
         "mean_rmse_raw": float(rmse.mean().detach().cpu()),
         "mean_mae_raw": float(mae.mean().detach().cpu()),
+        "total_rmse": float(total_rmse.detach().cpu()),
+        "total_mse": float(total_mse.detach().cpu()),
+        "total_mae": float(total_mae.detach().cpu()),
     }
 
     ema_suffix = "_ema" if has_ema else ""
@@ -1053,8 +1067,8 @@ def main_mode(
         print(get_scale_factors.remote())
     elif mode == "plot_missing_channel":
         print(plot_missing_channel(data_set=data_set, sample_index=sample_index, run_name=run_name, use_ema=use_ema))
-    elif mode == "eval_mse":
-        result = evaluate_mse_subset.remote(
+    elif mode == "eval_mse_missing_channel":
+        result = evaluate_mse_subset(
             data_set=data_set,
             max_samples=eval_samples,
             batch_size=eval_batch_size,
@@ -1073,7 +1087,7 @@ def main():
 
     parser = argparse.ArgumentParser()
 
-    parser.add_argument( "--mode", type=str, default="train_missing_channel",)
+    parser.add_argument( "--mode", type=str, default="eval_mse_missing_channel",)
     parser.add_argument( "--steps", type=int, default=10000,)
     parser.add_argument( "--quick-check-seconds", type=int, default=300,)
     parser.add_argument( "--batch-size", type=int, default=8,)
@@ -1082,7 +1096,7 @@ def main():
     parser.add_argument( "--seed", type=int, default=42,)
     parser.add_argument( "--deterministic", action="store_true", default=False)
     parser.add_argument( "--run-name", type=str, default="missing_channel",)
-    parser.add_argument( "--data-set", type=str, default="val",)
+    parser.add_argument( "--data-set", type=str, default="test_missing_channel",)
     parser.add_argument( "--sample-index", type=int, default=0,)
     parser.add_argument( "--eval-samples", type=int, default=64,)
     parser.add_argument( "--eval-batch-size", type=int, default=4,)

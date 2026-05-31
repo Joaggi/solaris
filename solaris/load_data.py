@@ -86,11 +86,15 @@ class CustomDataset_missing_channel(Dataset):
 
     def __getitem__(self, idx):
         """Get two 12-hour-separated history states and the 12-hour forecast target."""
+
+        
         corrupted_current_timestamp = self.ids[idx]
+        previous_timestamp = add_hours(corrupted_current_timestamp, -12)
         target_current_timestamp = self.ids[idx]
 
+        previous_data = load_wavelength_stack(self.root_dir, previous_timestamp, AIA_INPUT_WAVELENGTHS)
         current_data = load_wavelength_stack(self.root_dir, corrupted_current_timestamp, AIA_INPUT_WAVELENGTHS)
-        data = torch.unsqueeze(current_data, dim=0)
+        data = torch.stack((previous_data, current_data), dim=0)
         target = load_target_stack(self.root_dir, target_current_timestamp, AIA_PRETRAIN_WAVELENGTHS)
 
         random_missing_channel = torch.randint(len(AIA_INPUT_WAVELENGTHS), (1,)).item()
