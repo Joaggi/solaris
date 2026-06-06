@@ -8,6 +8,8 @@ from datetime import datetime, timedelta
 import json
 from pathlib import Path
 
+import pandas as pd
+
 import argparse
 
 
@@ -758,7 +760,7 @@ def evaluate_mse_subset(
         norm_coeff_1 = checkpoint["ema_norm_coeff_1"].to(device=device, dtype=torch.float32)
         norm_coeff_2 = checkpoint["ema_norm_coeff_2"].to(device=device, dtype=torch.float32)
 
-    model = Solaris_F107(out_levels=len(wavelengths), patch_size=int(checkpoint.get("patch_size", DEFAULT_PATCH_SIZE))).to(device)
+    model = Solaris_F107(freeze_backbone=True, output_dim=1, out_levels=len(wavelengths), patch_size=int(checkpoint.get("patch_size", DEFAULT_PATCH_SIZE))).to(device)
     model.load_state_dict(checkpoint["ema_model_state_dict"] if has_ema else checkpoint["model_state_dict"])
     model.eval()
 
@@ -791,6 +793,7 @@ def evaluate_mse_subset(
     evaluated_samples = 0
     first_timestamp = None
     last_timestamp = None
+    dataframe = []
 
     with torch.no_grad():
         for data, target, timestamps in loader:
@@ -799,19 +802,23 @@ def evaluate_mse_subset(
             transformed = transform(data, norm_coeff_1, norm_coeff_2, scale_factors)
             metadata = build_metadata(transformed, timestamps)
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                prediction_normalised = model(transformed, metadata, 12, 0).squeeze(1)
-            prediction_raw = _unscale_prediction(prediction_normalised.float(), scale_factors)
+                prediction_raw = model(transformed, metadata, 12, 0).squeeze(1)
             error = prediction_raw - target
             squared_error_sum += torch.sum(error.double() ** 2)
             absolute_error_sum += torch.sum(torch.abs(error).double())
-            pixel_count += target.shape[0] * target.shape[-2] * target.shape[-1]
+            pixel_count += target.shape[0]
             evaluated_samples += target.shape[0]
             first_timestamp = first_timestamp or timestamps[0].isoformat()
             last_timestamp = timestamps[-1].isoformat()
+            dataframe += list(([timestamp, t*dataset.max, p*dataset.max, e*dataset.max]  for timestamp, t, p, e in zip(timestamps, target.detach().cpu().to(torch.float32).numpy(), prediction_raw.detach().cpu().to(torch.float32).numpy(), error.detach().cpu().to(torch.float32).numpy())))
 
     mse = squared_error_sum / pixel_count
     rmse = torch.sqrt(mse)
     mae = absolute_error_sum / pixel_count
+    
+
+
+    
     result = {
         "run_name": run_name,
         "checkpoint": str(checkpoint_path),
@@ -835,6 +842,13 @@ def evaluate_mse_subset(
     ema_suffix = "_ema" if has_ema else ""
     json_path = EVAL_DIR / f"{run_name}{ema_suffix}_{data_set}_mse_subset_{evaluated_samples:04d}.json"
     md_path = EVAL_DIR / f"{run_name}{ema_suffix}_{data_set}_mse_subset_{evaluated_samples:04d}.md"
+    df_path = EVAL_DIR / f"{run_name}{ema_suffix}_{data_set}_mse_subset_{evaluated_samples:04d}.csv"
+    df = pd.DataFrame(dataframe, columns=["date", "target", "prediction_raw", "error"])
+    df.to_csv(df_path)
+
+    
+     
+
     json_path.write_text(json.dumps(result, indent=2), encoding="utf-8")
     lines = [
         f"# Solaris-S {data_set} subset raw-scale MSE",
@@ -942,7 +956,7 @@ def main_mode(
     elif mode == "scales":
         print(get_scale_factors.remote())
     elif mode == "eval_mse":
-        result = evaluate_mse_subset.remote(
+        result = evaluate_mse_subset(
             data_set=data_set,
             max_samples=eval_samples,
             batch_size=eval_batch_size,
@@ -961,7 +975,7 @@ def main():
 
     parser = argparse.ArgumentParser()
 
-    parser.add_argument( "--mode", type=str, default="train_f107",)
+    parser.add_argument( "--mode", type=str, default="eval_mse",)
     parser.add_argument( "--steps", type=int, default=1000,)
     parser.add_argument( "--quick-check-seconds", type=int, default=300,)
     parser.add_argument( "--batch-size", type=int, default=8,)
@@ -970,9 +984,9 @@ def main():
     parser.add_argument( "--seed", type=int, default=42,)
     parser.add_argument( "--deterministic", action="store_true", default=False)
     parser.add_argument( "--run-name", type=str, default="f107",)
-    parser.add_argument( "--data-set", type=str, default="val",)
+    parser.add_argument( "--data-set", type=str, default="test_f107",)
     parser.add_argument( "--sample-index", type=int, default=0,)
-    parser.add_argument( "--eval-samples", type=int, default=64,)
+    parser.add_argument( "--eval-samples", type=int, default=1349,)
     parser.add_argument( "--eval-batch-size", type=int, default=4,)
     parser.add_argument( "--use-wandb", action="store_true", default=False)
     parser.add_argument( "--wandb-project", type=str, default="allshaman",)

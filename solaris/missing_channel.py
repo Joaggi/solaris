@@ -892,6 +892,7 @@ def evaluate_mse_subset(
     total_absolute_error_sum = torch.tensor(0, dtype=torch.float64, device=device)
     squared_error_sum = torch.zeros(len(wavelengths), dtype=torch.float64, device=device)
     absolute_error_sum = torch.zeros(len(wavelengths), dtype=torch.float64, device=device)
+    sum_squares = torch.zeros(len(wavelengths), dtype=torch.float64, device=device)
     pixel_count = 0
     total_pixel_count = torch.tensor(0, dtype=torch.int64, device=device)
     evaluated_samples = torch.tensor(0, dtype=torch.int64, device=device)
@@ -912,6 +913,8 @@ def evaluate_mse_subset(
             total_absolute_error_sum += torch.sum(torch.abs(error).double())
             squared_error_sum += torch.sum(error.double() ** 2, dim=(0, 2, 3))
             absolute_error_sum += torch.sum(torch.abs(error).double(), dim=(0, 2, 3))
+            sum_squares += torch.sum(((target - target.mean(dim=(2,3), keepdim=True))**2).double(), dim=(0, 2, 3))
+
             pixel_count += target.shape[0] * target.shape[-2] * target.shape[-1]
             total_pixel_count += torch.prod(torch.tensor(target.size()))
             evaluated_samples += target.shape[0]
@@ -924,6 +927,8 @@ def evaluate_mse_subset(
     mse = squared_error_sum / pixel_count
     rmse = torch.sqrt(mse)
     mae = absolute_error_sum / pixel_count
+    sum_squares = sum_squares / pixel_count
+    r_square = 1 - mse / sum_squares
     evaluated_samples = evaluated_samples.detach().cpu().item()
     result = {
         "run_name": run_name,
@@ -940,9 +945,11 @@ def evaluate_mse_subset(
         "mse_raw": [float(value) for value in mse.detach().cpu()],
         "rmse_raw": [float(value) for value in rmse.detach().cpu()],
         "mae_raw": [float(value) for value in mae.detach().cpu()],
+        "r_square": [float(value) for value in r_square.detach().cpu()],
         "mean_mse_raw": float(mse.mean().detach().cpu()),
         "mean_rmse_raw": float(rmse.mean().detach().cpu()),
         "mean_mae_raw": float(mae.mean().detach().cpu()),
+        "mean_r_square": float(r_square.mean().detach().cpu()),
         "total_rmse": float(total_rmse.detach().cpu()),
         "total_mse": float(total_mse.detach().cpu()),
         "total_mae": float(total_mae.detach().cpu()),
@@ -962,14 +969,14 @@ def evaluate_mse_subset(
         f"- Sampling: evenly spaced indices across the split",
         f"- Timestamp range in evaluated batches: `{first_timestamp}` to `{last_timestamp}`",
         "",
-        "| Wavelength (A) | MSE (raw intensity^2) | RMSE (raw intensity) | MAE (raw intensity) |",
+        "| Wavelength (A) | MSE (raw intensity^2) | RMSE (raw intensity) | MAE (raw intensity) | R^2 (raw intensity) |",
         "|---:|---:|---:|---:|",
     ]
-    for wavelength, mse_value, rmse_value, mae_value in zip(wavelengths, result["mse_raw"], result["rmse_raw"], result["mae_raw"]):
-        lines.append(f"| {wavelength} | {mse_value:.6g} | {rmse_value:.6g} | {mae_value:.6g} |")
+    for wavelength, mse_value, rmse_value, mae_value, r_square in zip(wavelengths, result["mse_raw"], result["rmse_raw"], result["mae_raw"], result["r_square"]):
+        lines.append(f"| {wavelength} | {mse_value:.6g} | {rmse_value:.6g} | {mae_value:.6g} | {r_square:.6g} |")
     lines.extend(
         [
-            f"| **Mean** | **{result['mean_mse_raw']:.6g}** | **{result['mean_rmse_raw']:.6g}** | **{result['mean_mae_raw']:.6g}** |",
+            f"| **Mean** | **{result['mean_mse_raw']:.6g}** | **{result['mean_rmse_raw']:.6g}** | **{result['mean_mae_raw']:.6g}** |**{result['mean_r_square']:.6g}** |",
             "",
         ]
     )

@@ -111,8 +111,12 @@ class CustomDataset_f107(Dataset):
         self.f107 = pd.read_csv("data/AIA_12hour_512x512/f10.7.csv")
         self.f107_column = " f107"
 
-        self.f107[self.f107_column] = self.f107[self.f107_column] / self.f107[self.f107_column].max()
+
+        self.max = self.f107[self.f107_column].max()
+
+        self.f107[self.f107_column] = self.f107[self.f107_column] / self.max
         self.f107_mean = self.f107[self.f107_column].mean()
+
 
         self.ids = self._get_valid_ids()
 
